@@ -1,13 +1,20 @@
 """Database wrapper."""
 
 import asyncio
+from concurrent import futures
+from functools import partial
 from itertools import chain
 import logging
 import sys
+from threading import (
+    current_thread,
+    Thread,
+)
 from time import perf_counter
 from traceback import format_tb
 from typing import (
     Any,
+    Callable,
     cast,
     NamedTuple,
 )
@@ -18,16 +25,16 @@ from sqlalchemy import (
     event,
     text,
 )
+from sqlalchemy.engine import (
+    Connection,
+    Engine,
+    Result,
+)
 from sqlalchemy.exc import (
     ArgumentError,
     NoSuchModuleError,
 )
-from sqlalchemy_aio import ASYNCIO_STRATEGY
-from sqlalchemy_aio.asyncio import AsyncioEngine
-from sqlalchemy_aio.base import (
-    AsyncConnection,
-    AsyncResultProxy,
-)
+from sqlalchemy.sql.elements import TextClause
 
 #: Timeout for a query
 QueryTimeout = int | float
@@ -99,7 +106,7 @@ class InvalidQuerySchedule(Exception):
         )
 
 
-# database errors that mean the query won't ever succeed.  Not all possible
+# Database errors that mean the query won't ever succeed.  Not all possible
 # fatal errors are tracked here, because some DBAPI errors can happen in
 # circumstances which can be fatal or not.  Since there doesn't seem to be a
 # reliable way to know, there might be cases when a query will never succeed
@@ -107,7 +114,7 @@ class InvalidQuerySchedule(Exception):
 FATAL_ERRORS = (InvalidResultCount, InvalidResultColumnNames)
 
 
-def create_db_engine(dsn: str, **kwargs) -> AsyncioEngine:
+def create_db_engine(dsn: str, **kwargs) -> Engine:
     """Create the database engine, validating the DSN"""
     try:
         return create_engine(dsn, **kwargs)
@@ -132,13 +139,16 @@ class QueryResults(NamedTuple):
     latency: float | None = None
 
     @classmethod
-    async def from_results(cls, results: AsyncResultProxy):
+    def from_result(cls, result: Result) -> "QueryResults":
         """Return a QueryResults from results for a query."""
-        conn_info = results._result_proxy.connection.info
-        latency = conn_info.get("query_latency", None)
-        return cls(
-            await results.keys(), await results.fetchall(), latency=latency
-        )
+        if result.returns_rows:
+            keys = list(result.keys())
+            rows = result.all()
+        else:
+            keys = []
+            rows = []
+        latency = result.connection.info.get("query_latency", None)
+        return cls(keys, rows, latency=latency)
 
 
 class MetricResult(NamedTuple):
@@ -233,11 +243,146 @@ class Query:
             raise InvalidQueryParameters(self.name)
 
 
+class WorkerAction:
+    """An action to be called in the worker thread."""
+
+    def __init__(self, func: Callable):
+        self.func = func
+        self._future: asyncio.Future = asyncio.get_event_loop().create_future()
+
+    def __str__(self) -> str:
+        if isinstance(self.func, partial):
+            return self.func.func.__name__
+        return self.func.__name__
+
+    def set_result(self, result):
+        """Set the result of the action."""
+        self._future.set_result(result)
+
+    def set_exception(self, exception: Exception):
+        """Set the result of the action."""
+        self._future.set_exception(exception)
+
+    async def result(self):
+        """Return the action result."""
+        return await self._future
+
+
+class DataBaseConnection:
+    """A connection to a database engine."""
+
+    _conn: Connection | None = None
+    _worker: Thread | None = None
+
+    def __init__(
+        self,
+        dbname: str,
+        engine: Engine,
+        logger: logging.Logger = logging.getLogger(),
+    ):
+        self.dbname = dbname
+        self.engine = engine
+        self.logger = logger
+        self._loop = asyncio.get_event_loop()
+        self._queue: asyncio.Queue = asyncio.Queue()
+
+    @property
+    def connected(self) -> bool:
+        """Whether the connection is open."""
+        return self._conn is not None
+
+    async def open(self):
+        """Open the connection."""
+        if self.connected:
+            return
+
+        self._create_worker()
+        return await self._call_in_thread(self._connect)
+
+    async def close(self):
+        """Close the connection."""
+        if not self.connected:
+            return
+
+        await self._call_in_thread(self._close)
+
+    async def execute(
+        self,
+        sql: TextClause,
+        parameters: dict[str, Any] | None = None,
+    ) -> QueryResults:
+        """Execute a query, returning results."""
+        if parameters is None:
+            parameters = {}
+        result = await self._call_in_thread(self._execute, sql, parameters)
+        query_results: QueryResults = await self._call_in_thread(
+            QueryResults.from_result, result
+        )
+        return query_results
+
+    def _create_worker(self):
+        """Create the worker thread."""
+        self._worker = Thread(
+            target=self._run, name=f"DataBase-{self.dbname}", daemon=True
+        )
+        self._worker.start()
+
+    def _connect(self):
+        self._conn = self.engine.connect()
+
+    def _execute(self, sql: TextClause, parameters: dict[str, Any]) -> Result:
+        self._conn: Connection
+        return self._conn.execute(sql, parameters)
+
+    def _close(self):
+        self._conn: Connection
+        self._conn.detach()
+        self._conn.close()
+        self._conn = None
+
+    def _run(self):
+        """The worker thread function."""
+
+        def debug(message: str):
+            self.logger.debug(f'worker "{current_thread().name}": {message}')
+
+        debug(f"started with ID {current_thread().native_id}")
+        while True:
+            future = asyncio.run_coroutine_threadsafe(
+                self._queue.get(), self._loop
+            )
+            try:
+                action = future.result()
+                debug(f'received action "{action}"')
+            except futures.CancelledError:
+                debug("shutting down")
+                return
+
+            try:
+                result = action.func()
+            except Exception as e:
+                self._loop.call_soon_threadsafe(action.set_exception, e)
+            else:
+                self._loop.call_soon_threadsafe(action.set_result, result)
+            finally:
+                self._loop.call_soon_threadsafe(self._queue.task_done)
+                if self._conn is None:
+                    # the connection has been closed, exit the thread
+                    debug("shutting down")
+                    return
+
+    async def _call_in_thread(self, func: Callable, *args, **kwargs):
+        """Call a sync action in the worker thread."""
+        call = WorkerAction(partial(func, *args, **kwargs))
+        await self._queue.put(call)
+        return await call.result()
+
+
 class DataBase:
     """A database to perform Queries."""
 
-    _engine: AsyncioEngine
-    _conn: AsyncConnection | None = None
+    _conn: DataBaseConnection
+    _logger: logging.Logger = logging.getLogger()
     _pending_queries: int = 0
 
     def __init__(
@@ -248,13 +393,12 @@ class DataBase:
         self.config = config
         self.logger = logger
         self._connect_lock = asyncio.Lock()
-        self._engine = create_db_engine(
+        engine = create_db_engine(
             self.config.dsn,
-            strategy=ASYNCIO_STRATEGY,
             execution_options={"autocommit": self.config.autocommit},
         )
-
-        self._setup_query_latency_tracking()
+        self._conn = DataBaseConnection(self.config.name, engine, self.logger)
+        self._setup_query_latency_tracking(engine)
 
     async def __aenter__(self):
         await self.connect()
@@ -266,7 +410,7 @@ class DataBase:
     @property
     def connected(self) -> bool:
         """Whether the database is connected."""
-        return self._conn is not None
+        return self._conn.connected
 
     async def connect(self):
         """Connect to the database."""
@@ -275,7 +419,7 @@ class DataBase:
                 return
 
             try:
-                self._conn = await self._engine.connect()
+                await self._conn.open()
             except Exception as error:
                 raise self._db_error(error, exc_class=DataBaseConnectError)
 
@@ -304,10 +448,11 @@ class DataBase:
             f'running query "{query.name}" on database "{self.config.name}"'
         )
         self._pending_queries += 1
-        self._conn: AsyncConnection
         try:
-            result = await self._execute_query(query)
-            return query.results(await QueryResults.from_results(result))
+            query_results = await self.execute_sql(
+                query.sql, parameters=query.parameters, timeout=query.timeout
+            )
+            return query.results(query_results)
         except asyncio.TimeoutError:
             raise self._query_timeout_error(
                 query.name, cast(QueryTimeout, query.timeout)
@@ -327,33 +472,22 @@ class DataBase:
         sql: str,
         parameters: dict[str, Any] | None = None,
         timeout: QueryTimeout | None = None,
-    ) -> AsyncResultProxy:
+    ) -> QueryResults:
         """Execute a raw SQL query."""
         if parameters is None:
             parameters = {}
-        self._conn: AsyncConnection
         return await asyncio.wait_for(
             self._conn.execute(text(sql), parameters),
             timeout=timeout,
         )
 
-    async def _execute_query(self, query: Query) -> AsyncResultProxy:
-        """Execute a query."""
-        return await self.execute_sql(
-            query.sql, parameters=query.parameters, timeout=query.timeout
-        )
-
     async def _close(self):
         # ensure the connection with the DB is actually closed
-        self._conn.sync_connection.detach()
         await self._conn.close()
-        self._conn = None
         self._pending_queries = 0
         self.logger.debug(f'disconnected from database "{self.config.name}"')
 
-    def _setup_query_latency_tracking(self):
-        engine = self._engine.sync_engine
-
+    def _setup_query_latency_tracking(self, engine: Engine):
         @event.listens_for(engine, "before_cursor_execute")
         def before_cursor_execute(
             conn, cursor, statement, parameters, context, executemany
